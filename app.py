@@ -130,7 +130,8 @@ if uploaded_file is not None:
                 
                 # Remover subplots vazios
                 for i in range(n_cols, len(axes)):
-                    fig.delaxes(axes[i])
+                    #fig.delaxes(axes[i])
+                    axes[i].set_visible(False)
                 
                 plt.tight_layout()
                 st.pyplot(fig)
