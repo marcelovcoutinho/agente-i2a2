@@ -1,18 +1,27 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
-from groq import Groq
-import openai
-import google.generativeai as genai
-from scipy import stats
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 import warnings
-warnings.filterwarnings('ignore') 
+warnings.filterwarnings('ignore')
+
+# ====== Dependências opcionais ======
+HAVE_SKLEARN = True
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+except Exception:
+    HAVE_SKLEARN = False
+
+HAVE_SCIPY = True
+try:
+    from scipy import stats
+except Exception:
+    HAVE_SCIPY = False
 
 # =========================
 # Configuração da página
@@ -29,61 +38,108 @@ if 'data_context' not in st.session_state:
     st.session_state.data_context = None
 
 # =========================
-# Funções utilitárias - IA
+# IA - chamada com fallback
 # =========================
 def call_ai_api(api_choice, api_key, messages, model):
+    """
+    Lazy-import dos SDKs e compatibilidade com versões antigas/novas.
+    Retorna string com a resposta ou uma mensagem de erro amigável.
+    """
     try:
         if api_choice == "OpenAI":
-            client = openai.OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=model, messages=messages, max_tokens=2000, temperature=0.7
-            )
-            return response.choices[0].message.content
+            try:
+                import openai as openai_pkg
+            except Exception:
+                return "Erro: o pacote 'openai' não está instalado. Rode: pip install -U openai"
+
+            # SDK novo (>=1.0) ou legado
+            if hasattr(openai_pkg, "OpenAI"):
+                try:
+                    client = openai_pkg.OpenAI(api_key=api_key)
+                    resp = client.chat.completions.create(
+                        model=model, messages=messages, max_tokens=2000, temperature=0.7
+                    )
+                    return resp.choices[0].message.content
+                except Exception:
+                    try:  # fallback p/ legado
+                        openai_pkg.api_key = api_key
+                        resp = openai_pkg.ChatCompletion.create(
+                            model=model, messages=messages, max_tokens=2000, temperature=0.7
+                        )
+                        return resp.choices[0].message["content"]
+                    except Exception as e2:
+                        return f"Erro OpenAI: {e2}"
+            else:
+                try:
+                    openai_pkg.api_key = api_key
+                    resp = openai_pkg.ChatCompletion.create(
+                        model=model, messages=messages, max_tokens=2000, temperature=0.7
+                    )
+                    return resp.choices[0].message["content"]
+                except Exception as e:
+                    return f"Erro OpenAI: {e}"
+
         elif api_choice == "Groq":
-            client = Groq(api_key=api_key)
-            response = client.chat.completions.create(
-                model=model, messages=messages, max_tokens=2000, temperature=0.7
-            )
-            return response.choices[0].message.content
+            try:
+                from groq import Groq
+            except Exception:
+                return "Erro: o pacote 'groq' não está instalado. Rode: pip install -U groq"
+            try:
+                client = Groq(api_key=api_key)
+                resp = client.chat.completions.create(
+                    model=model, messages=messages, max_tokens=2000, temperature=0.7
+                )
+                return resp.choices[0].message.content
+            except Exception as e:
+                return f"Erro Groq: {e}"
+
         elif api_choice == "Gemini":
-            genai.configure(api_key=api_key)
-            model_instance = genai.GenerativeModel(model)
-            prompt = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
-            response = model_instance.generate_content(prompt)
-            return response.text
+            try:
+                import google.generativeai as genai
+            except Exception:
+                return "Erro: o pacote 'google-generativeai' não está instalado. Rode: pip install -U google-generativeai"
+            try:
+                genai.configure(api_key=api_key)
+                model_instance = genai.GenerativeModel(model)
+                prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+                resp = model_instance.generate_content(prompt)
+                return resp.text
+            except Exception as e:
+                return f"Erro Gemini: {e}"
+
+        return "Erro: API não reconhecida."
     except Exception as e:
-        return f"Erro: {str(e)}"
+        return f"Erro inesperado: {e}"
 
 # =========================
-# Funções utilitárias - Análises
+# Análises - artefatos p/ chat
 # =========================
 def compute_analysis_artifacts(df: pd.DataFrame):
-    """Calcula e retorna artefatos de TODAS as abas para o chat."""
+    """Calcula artefatos de TODAS as abas para o chat."""
     artifacts = {}
 
-    # Colunas por tipo
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
     artifacts["numeric_columns"] = numeric_cols
-    artifacts["categororical_columns"] = categorical_cols  # manter chave legada (typo)
+    artifacts["categororical_columns"] = categorical_cols  # legado
     artifacts["categorical_columns"] = categorical_cols
 
-    # Estatísticas numéricas + variância (ddof=1 = amostral)
+    # Estatísticas + variância (amostral, ddof=1)
     if numeric_cols:
         desc = df[numeric_cols].describe().T
-        desc["var"] = df[numeric_cols].var()  # populacional: var(ddof=0)
+        desc["var"] = df[numeric_cols].var()
         artifacts["numeric_describe"] = (
             desc.reset_index().rename(columns={"index": "coluna"}).to_dict(orient="records")
         )
     else:
         artifacts["numeric_describe"] = []
 
-    # Nulos por coluna
+    # Nulos
     artifacts["missing_values"] = (
         df.isnull().sum().rename("nulos").reset_index().rename(columns={"index": "coluna"}).to_dict("records")
     )
 
-    # Top categorias (limita a 5 colunas para não estourar tokens)
+    # Top categorias (limita a 5 colunas)
     top_cats = {}
     for col in categorical_cols[:5]:
         vc = df[col].astype(str).value_counts(dropna=False).head(10)
@@ -107,14 +163,12 @@ def compute_analysis_artifacts(df: pd.DataFrame):
         sig_corr = sorted(sig_corr, key=lambda x: abs(x["r"]), reverse=True)
     artifacts["significant_correlations"] = sig_corr
 
-    # Outliers por IQR e Z-score (resumo)
+    # Outliers (IQR e z-score)
     outliers_summary = []
     for col in numeric_cols:
         series = df[col].dropna()
         if series.empty:
-            outliers_summary.append({
-                "variavel": col, "outliers_iqr": 0, "pct_iqr": 0.0, "outliers_z": 0, "pct_z": 0.0
-            })
+            outliers_summary.append({"variavel": col, "outliers_iqr": 0, "pct_iqr": 0.0, "outliers_z": 0, "pct_z": 0.0})
             continue
         Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
         IQR = Q3 - Q1
@@ -123,10 +177,13 @@ def compute_analysis_artifacts(df: pd.DataFrame):
         n_iqr = int(iqr_mask.sum())
         pct_iqr = float(n_iqr / len(df) * 100)
 
-        try:
-            z = np.abs(stats.zscore(series))
-            n_z = int((z > 3).sum())
-        except Exception:
+        if HAVE_SCIPY:
+            try:
+                z = np.abs(stats.zscore(series))
+                n_z = int((z > 3).sum())
+            except Exception:
+                n_z = 0
+        else:
             n_z = 0
         pct_z = float(n_z / len(df) * 100)
 
@@ -138,17 +195,14 @@ def compute_analysis_artifacts(df: pd.DataFrame):
             "pct_z": pct_z
         })
 
-    outliers_summary = sorted(outliers_summary, key=lambda x: x["pct_iqr"], reverse=True)[:50]
-    artifacts["outliers_summary"] = outliers_summary
+    artifacts["outliers_summary"] = sorted(outliers_summary, key=lambda x: x["pct_iqr"], reverse=True)[:50]
 
-    # Amostra
+    # Básicos
     artifacts["sample_data"] = df.head(5).to_dict("records")
-
-    # Shape e colunas
     artifacts["shape"] = df.shape
     artifacts["columns"] = df.columns.tolist()
 
-    # Inicializa chaves de cluster (vazias até o usuário rodar)
+    # Campos de cluster (inicialmente vazios)
     artifacts.update({
         "cluster_available": False,
         "cluster_k": None,
@@ -160,17 +214,16 @@ def compute_analysis_artifacts(df: pd.DataFrame):
         "cluster_sample_labeled": [],
         "cluster_silhouettes_grid": {},
     })
-
     return artifacts
 
+# ---------- clustering helpers ----------
 def prepare_features_for_clustering(df: pd.DataFrame, numeric_cols, categorical_cols, max_cat_levels=20):
-    """
-    Seleciona colunas, trata nulos, faz one-hot das categóricas (limitando cardinalidade) e padroniza.
-    Retorna X (np.array), feat_names (list), df_model (DataFrame tratado).
-    """
+    if not HAVE_SKLEARN:
+        raise RuntimeError("scikit-learn ausente")
+
     work = pd.DataFrame(index=df.index)
 
-    # Numéricas (imputação simples com mediana)
+    # Numéricas (imputação mediana)
     if numeric_cols:
         num_df = df[numeric_cols].copy()
         for c in num_df.columns:
@@ -178,7 +231,7 @@ def prepare_features_for_clustering(df: pd.DataFrame, numeric_cols, categorical_
                 num_df[c] = num_df[c].fillna(num_df[c].median())
         work = pd.concat([work, num_df], axis=1)
 
-    # Categóricas (one-hot com top categorias para não explodir dimensionalidade)
+    # Categóricas (one-hot com top categorias)
     cat_dfs = []
     for c in (categorical_cols or []):
         vc = df[c].astype(str).value_counts()
@@ -188,20 +241,13 @@ def prepare_features_for_clustering(df: pd.DataFrame, numeric_cols, categorical_
     if cat_dfs:
         work = pd.concat([work] + cat_dfs, axis=1)
 
-    # Guarda nomes antes da escala
     feat_names = work.columns.tolist()
 
-    # Padronização (inclui dummies também; funciona bem com KMeans)
     scaler = StandardScaler(with_mean=True, with_std=True)
     X = scaler.fit_transform(work.values)
-
     return X, feat_names, work
 
 def auto_kmeans(X, k_min=2, k_max=8, random_state=42):
-    """
-    Testa K de k_min a k_max e escolhe por maior silhouette.
-    Retorna (best_k, best_model, silhouettes_dict).
-    """
     best_k, best_score, best_model = None, -1, None
     silhouettes = {}
     for k in range(k_min, min(k_max, len(X) - 1) + 1):
@@ -220,24 +266,19 @@ def auto_kmeans(X, k_min=2, k_max=8, random_state=42):
 
 def compute_cluster_artifacts(df: pd.DataFrame, numeric_cols, categorical_cols,
                               auto_k=True, k_manual=3, k_range=(2, 8), random_state=42):
-    """
-    Orquestra o clustering e cria artefatos para UI e Chat:
-    - labels, PCA 2D, silhouette, resumo por cluster, grid de silhouettes.
-    """
-    artifacts = {"cluster_available": False}
+    if not HAVE_SKLEARN:
+        return {"cluster_available": False}
 
     if not numeric_cols and not categorical_cols:
-        return artifacts
+        return {"cluster_available": False}
 
-    # Prepara features
     X, feat_names, df_model = prepare_features_for_clustering(df, numeric_cols, categorical_cols)
 
-    # Escolha de K
     silhouettes = {}
     if auto_k:
         best_k, model, silhouettes = auto_kmeans(X, k_min=k_range[0], k_max=k_range[1], random_state=random_state)
         if not model:
-            return artifacts
+            return {"cluster_available": False}
         k = best_k
         labels = model.predict(X)
         sil = silhouette_score(X, labels) if len(set(labels)) > 1 else None
@@ -247,21 +288,20 @@ def compute_cluster_artifacts(df: pd.DataFrame, numeric_cols, categorical_cols,
         labels = model.fit_predict(X)
         sil = silhouette_score(X, labels) if len(set(labels)) > 1 else None
 
-    # PCA 2D para visualização
     pca = PCA(n_components=2, random_state=random_state)
     X2 = pca.fit_transform(X)
 
-    # Perfil dos clusters (médias/proporções)
     prof_df = df_model.copy()
     prof_df["__cluster__"] = labels
-    profile = prof_df.groupby("__cluster__").mean(numeric_only=True).reset_index().rename(columns={"__cluster__": "cluster"})
+    profile = (prof_df.groupby("__cluster__").mean(numeric_only=True)
+               .reset_index()
+               .rename(columns={"__cluster__": "cluster"}))
 
-    # Amostra com rótulos
     sample_labeled = df.copy()
     sample_labeled["cluster"] = labels
     sample_rows = sample_labeled.sample(min(5, len(sample_labeled)), random_state=random_state).to_dict("records")
 
-    artifacts.update({
+    return {
         "cluster_available": True,
         "cluster_k": int(k),
         "cluster_silhouette": float(sil) if sil is not None else None,
@@ -271,11 +311,11 @@ def compute_cluster_artifacts(df: pd.DataFrame, numeric_cols, categorical_cols,
         "cluster_feat_names": feat_names,
         "cluster_sample_labeled": sample_rows,
         "cluster_silhouettes_grid": {int(kk): float(v) for kk, v in silhouettes.items()},
-    })
-    return artifacts
+    }
 
+# ---------- prompt builder ----------
 def build_chat_context(art):
-    """Formata um contexto compacto com resultados de TODAS as abas (inclui Clusters) para a IA."""
+    """Contexto compacto com resultados de TODAS as abas (inclui Clusters)."""
     def fmt_rows(rows, keys, max_rows=10):
         rows = rows[:max_rows]
         out = []
@@ -288,15 +328,15 @@ def build_chat_context(art):
     stat_keys = [k for k in ["coluna", "count", "mean", "std", "var", "min", "25%", "50%", "75%", "max"] if any(k in d for d in num_stats)]
     stats_txt = fmt_rows(num_stats, stat_keys, max_rows=15)
 
-    # Correlações (top 15)
+    # Correlações
     corr = art.get("significant_correlations", [])[:15]
     corr_txt = fmt_rows(corr, ["var1", "var2", "r", "forca"], max_rows=15)
 
-    # Outliers (top 15 por %IQR)
+    # Outliers
     outs = art.get("outliers_summary", [])[:15]
     outs_txt = fmt_rows(outs, ["variavel", "outliers_iqr", "pct_iqr", "outliers_z", "pct_z"], max_rows=15)
 
-    # Top categorias (até 5 colunas)
+    # Categóricas
     cats = art.get("top_categories", {})
     cats_txt_parts = []
     for col, items in cats.items():
@@ -312,8 +352,7 @@ def build_chat_context(art):
     if art.get("cluster_available", False):
         k = art.get("cluster_k")
         sil = art.get("cluster_silhouette")
-        prof = art.get("cluster_profile", [])[:10]  # limita
-        # Formata perfis de forma compacta (primeiras 10 features por cluster)
+        prof = art.get("cluster_profile", [])[:10]
         def fmt_profile_row(r: dict, top_n=10):
             items = list(r.items())
             items = sorted(items, key=lambda kv: (kv[0] != "cluster", kv[0]))
@@ -384,17 +423,32 @@ if uploaded_file is not None:
         data = pd.read_csv(uploaded_file)
         st.success(f"✅ Arquivo carregado: {data.shape[0]} linhas x {data.shape[1]} colunas")
 
-        # Preparar contexto para IA + artefatos de TODAS as abas
+        # ---- calcula EDA e PRESERVA clusters no rerun ----
         artifacts = compute_analysis_artifacts(data)
-        st.session_state.data_context = artifacts
+        if st.session_state.data_context is None:
+            st.session_state.data_context = artifacts
+        else:
+            # preserva chaves de cluster (se já existirem) antes de atualizar EDA
+            preserved_keys = [
+                "cluster_available","cluster_k","cluster_silhouette","cluster_labels",
+                "cluster_pca_2d","cluster_profile","cluster_feat_names",
+                "cluster_sample_labeled","cluster_silhouettes_grid"
+            ]
+            preserved = {k: st.session_state.data_context.get(k) for k in preserved_keys}
+            # atualiza com nova EDA
+            st.session_state.data_context.update(artifacts)
+            # restaura clusters se existirem
+            for k, v in preserved.items():
+                if v not in (None, [], {}, False):
+                    st.session_state.data_context[k] = v
 
-        # Detectar tipos (para uso nas abas também)
-        numeric_cols = artifacts["numeric_columns"]
-        categorical_cols = artifacts["categorical_columns"]
+        numeric_cols = st.session_state.data_context["numeric_columns"]
+        categorical_cols = st.session_state.data_context["categorical_columns"]
 
         # Abas
         tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-            "📋 Visão Geral", "📊 Distribuições", "🔍 Correlações", "📈 Tendências", "⚠️ Anomalias", "🤖 Chat IA", "🧩 Clusters"
+            "📋 Visão Geral", "📊 Distribuições", "🔍 Correlações",
+            "📈 Tendências", "⚠️ Anomalias", "🤖 Chat IA", "🧩 Clusters"
         ])
 
         with tab1:
@@ -427,15 +481,23 @@ if uploaded_file is not None:
                     stats_df["Variância"] = data[numeric_cols].var()  # ddof=1
                     st.dataframe(stats_df.T, use_container_width=True)
 
-                # Botão para recalcular artefatos (se o DataFrame mudar)
+                # Recalcular EDA PRESERVANDO clusters
                 if st.button("🔄 Atualizar análise (recalcular artefatos)"):
-                    st.session_state.data_context = compute_analysis_artifacts(data)
-                    st.success("Artefatos recalculados.")
+                    new_art = compute_analysis_artifacts(data)
+                    preserved_keys = [
+                        "cluster_available","cluster_k","cluster_silhouette","cluster_labels",
+                        "cluster_pca_2d","cluster_profile","cluster_feat_names",
+                        "cluster_sample_labeled","cluster_silhouettes_grid"
+                    ]
+                    for k in preserved_keys:
+                        new_art[k] = st.session_state.data_context.get(k)
+                    st.session_state.data_context = new_art
+                    st.success("Artefatos recalculados (clusters preservados).")
 
         with tab2:
             st.header("📊 Distribuições")
 
-            # Variáveis numéricas
+            # Numéricas
             if numeric_cols:
                 st.subheader("Variáveis Numéricas")
                 n_cols = len(numeric_cols)
@@ -444,8 +506,6 @@ if uploaded_file is not None:
 
                 fig, axes = plt.subplots(rows, cols_per_row, figsize=(15, 5*rows))
                 fig.patch.set_facecolor('#0E1117')
-
-                # Normaliza eixos para 1D
                 axes = np.atleast_1d(axes).ravel()
 
                 for i, col in enumerate(numeric_cols):
@@ -456,7 +516,6 @@ if uploaded_file is not None:
                     ax.tick_params(colors='white', labelsize=8)
                     ax.grid(True, alpha=0.3)
 
-                # Oculta eixos não usados (evita delaxes)
                 for i in range(n_cols, len(axes)):
                     axes[i].set_visible(False)
 
@@ -464,10 +523,10 @@ if uploaded_file is not None:
                 st.pyplot(fig)
                 plt.close(fig)
 
-            # Variáveis categóricas
+            # Categóricas
             if categorical_cols:
                 st.subheader("Variáveis Categóricas")
-                for col in categorical_cols[:5]:  # Máximo 5
+                for col in categorical_cols[:5]:
                     value_counts = data[col].value_counts().head(10)
 
                     fig, ax = plt.subplots(figsize=(10, 6))
@@ -510,7 +569,7 @@ if uploaded_file is not None:
                 st.pyplot(fig)
                 plt.close(fig)
 
-                # Correlações significativas
+                # Pares significativos
                 st.subheader("Correlações Significativas")
                 correlations = []
                 for i in range(len(correlation_matrix.columns)):
@@ -523,10 +582,8 @@ if uploaded_file is not None:
                                 'Correlação': f"{corr_value:.3f}",
                                 'Força': 'Forte' if abs(corr_value) > 0.7 else 'Moderada' if abs(corr_value) > 0.3 else 'Fraca'
                             })
-
                 if correlations:
-                    corr_df = pd.DataFrame(correlations)
-                    st.dataframe(corr_df, use_container_width=True)
+                    st.dataframe(pd.DataFrame(correlations), use_container_width=True)
                 else:
                     st.info("Não há correlações significativas.")
             else:
@@ -535,8 +592,7 @@ if uploaded_file is not None:
         with tab4:
             st.header("📈 Tendências")
 
-            # Detectar colunas temporais
-            time_cols = [col for col in data.columns if any(keyword in col.lower() for keyword in ['time', 'date', 'timestamp', 'year', 'month'])]
+            time_cols = [col for col in data.columns if any(k in col.lower() for k in ['time', 'date', 'timestamp', 'year', 'month'])]
 
             if time_cols and numeric_cols:
                 st.subheader("Tendências Temporais")
@@ -551,16 +607,15 @@ if uploaded_file is not None:
                     fig.patch.set_facecolor('#0E1117')
 
                     data_sorted = data.sort_values(time_col)
-                    x_values = range(len(data_sorted))
+                    x_values = list(range(len(data_sorted)))
                     y_values = data_sorted[numeric_col]
 
-                    ax.scatter(list(x_values), y_values, alpha=0.6, color='cyan', s=20, label='Dados')
+                    ax.scatter(x_values, y_values, alpha=0.6, color='cyan', s=20, label='Dados')
 
-                    # Linha de tendência
                     try:
                         mask = ~pd.isna(y_values)
                         if mask.sum() > 1:
-                            x_clean = np.array(list(x_values))[mask]
+                            x_clean = np.array(x_values)[mask]
                             y_clean = np.array(y_values)[mask]
                             z = np.polyfit(x_clean, y_clean, 1)
                             p = np.poly1d(z)
@@ -580,7 +635,6 @@ if uploaded_file is not None:
                     st.pyplot(fig)
                     plt.close(fig)
 
-            # Correlação visual (par de maior |r|)
             if len(numeric_cols) >= 2:
                 st.subheader("Correlação Visual")
                 corr_matrix = data[numeric_cols].corr()
@@ -597,7 +651,6 @@ if uploaded_file is not None:
 
                     ax.scatter(data[var1], data[var2], alpha=0.6, color='lightgreen', s=30)
 
-                    # Linha de regressão
                     try:
                         mask = ~(pd.isna(data[var1]) | pd.isna(data[var2]))
                         if mask.sum() > 1:
@@ -624,15 +677,12 @@ if uploaded_file is not None:
 
             if numeric_cols:
                 st.subheader("Resumo de Outliers")
-
-                # Usa exatamente o que foi salvo no contexto
                 outliers_summary = st.session_state.data_context.get("outliers_summary", [])
                 if outliers_summary:
                     st.dataframe(pd.DataFrame(outliers_summary), use_container_width=True)
                 else:
                     st.info("Sem resumo de outliers calculado.")
 
-                # Boxplots
                 st.subheader("Boxplots")
                 n_cols = len(numeric_cols)
                 cols_per_row = 4
@@ -640,7 +690,6 @@ if uploaded_file is not None:
 
                 fig, axes = plt.subplots(rows, cols_per_row, figsize=(16, 4*rows))
                 fig.patch.set_facecolor('#0E1117')
-
                 axes = np.atleast_1d(axes).ravel()
 
                 for i, col in enumerate(numeric_cols):
@@ -667,7 +716,6 @@ if uploaded_file is not None:
         with tab6:
             st.header("🤖 Chat com IA")
 
-            # Configuração
             c1, c2, c3 = st.columns(3)
             with c1:
                 api_choice = st.selectbox("API:", ["OpenAI", "Groq", "Gemini"])
@@ -682,7 +730,6 @@ if uploaded_file is not None:
                     models = ["gemini-pro"]
                 model = st.selectbox("Modelo:", models)
 
-            # Histórico
             if st.session_state.conversation_history:
                 st.subheader("Conversa")
                 for msg in st.session_state.conversation_history[-6:]:
@@ -692,10 +739,9 @@ if uploaded_file is not None:
                         st.markdown(f"**🤖:** {msg['content']}")
                 st.markdown("---")
 
-            # Input
             user_question = st.text_area(
                 "Sua pergunta:",
-                placeholder="Ex: Quais são os principais outliers, como tratá-los e o que diferencia cada cluster?",
+                placeholder="Ex: Existem clusters? O que diferencia cada grupo? Quais outliers tratar primeiro?",
                 height=100
             )
 
@@ -704,17 +750,12 @@ if uploaded_file is not None:
                 if st.button("🚀 Enviar", type="primary"):
                     if user_question.strip() and api_key:
                         st.session_state.conversation_history.append({"role": "user", "content": user_question})
-
                         with st.spinner("Processando..."):
-                            # Usa o contexto enriquecido (inclui clusters se já rodados)
                             context = build_chat_context(st.session_state.data_context)
-
                             messages = [{"role": "system", "content": context}]
                             messages.extend(st.session_state.conversation_history[-4:])
-
                             response = call_ai_api(api_choice, api_key, messages, model)
                             st.session_state.conversation_history.append({"role": "assistant", "content": response})
-
                             st.success("✅ Resposta:")
                             st.markdown(response)
                     else:
@@ -725,25 +766,26 @@ if uploaded_file is not None:
                     st.session_state.conversation_history = []
                     st.rerun()
 
-            # Instruções
             if not api_key:
                 st.info(f"🔑 Como obter chave {api_choice}:")
                 if api_choice == "OpenAI":
-                    st.markdown("1. [platform.openai.com](https://platform.openai.com) → API Keys")
+                    st.markdown("1. https://platform.openai.com → API Keys")
                 elif api_choice == "Groq":
-                    st.markdown("1. [console.groq.com](https://console.groq.com) → API Keys")
+                    st.markdown("1. https://console.groq.com → API Keys")
                 else:
-                    st.markdown("1. [makersuite.google.com](https://makersuite.google.com) → Get API Key")
+                    st.markdown("1. https://makersuite.google.com → Get API Key")
 
         with tab7:
             st.header("🧩 Análise de Agrupamento (KMeans)")
-
-            if not (numeric_cols or categorical_cols):
+            if not HAVE_SKLEARN:
+                st.warning("Aba desativada: instale scikit-learn para habilitar clustering. Ex.: `pip install -U scikit-learn`")
+            elif not (numeric_cols or categorical_cols):
                 st.info("O dataset não possui colunas suficientes para clusterização.")
             else:
+                toggle_fn = getattr(st, "toggle", None)
                 c1, c2, c3 = st.columns([1,1,2])
                 with c1:
-                    auto_k = st.toggle("K automático (silhouette)", value=True)
+                    auto_k = toggle_fn("K automático (silhouette)", value=True) if toggle_fn else st.checkbox("K automático (silhouette)", value=True)
                 with c2:
                     k_manual = st.number_input("K (se manual)", min_value=2, max_value=15, value=3, step=1, disabled=auto_k)
                 with c3:
@@ -753,16 +795,12 @@ if uploaded_file is not None:
                     with st.spinner("Clusterizando..."):
                         cl_art = compute_cluster_artifacts(
                             data, numeric_cols, categorical_cols,
-                            auto_k=auto_k,
-                            k_manual=k_manual,
-                            k_range=(kmin, kmax),
-                            random_state=42
+                            auto_k=auto_k, k_manual=k_manual, k_range=(kmin, kmax), random_state=42
                         )
-
                         if not cl_art.get("cluster_available", False):
-                            st.error("Não foi possível formar clusters com estabilidade suficiente.")
+                            st.error("Não foi possível formar clusters estáveis (ou scikit-learn ausente).")
                         else:
-                            # Guarda no contexto para o Chat IA
+                            # >>> registra clusters na 'memória' e mantém nos reruns <<<
                             st.session_state.data_context.update(cl_art)
 
                             if cl_art['cluster_silhouette'] is not None:
@@ -770,7 +808,6 @@ if uploaded_file is not None:
                             else:
                                 st.success(f"Clusters formados: K={cl_art['cluster_k']} (silhouette=—)")
 
-                            # Mostra grid de silhouettes testadas (se automático)
                             if cl_art.get("cluster_silhouettes_grid"):
                                 st.subheader("Silhouette por K testado")
                                 sil_df = pd.DataFrame(
@@ -778,13 +815,11 @@ if uploaded_file is not None:
                                 ).sort_values("K")
                                 st.dataframe(sil_df, use_container_width=True)
 
-                            # PCA 2D plot
                             st.subheader("Visualização PCA 2D")
                             X2 = np.array(cl_art["cluster_pca_2d"])
                             labels = np.array(cl_art["cluster_labels"])
-
                             fig, ax = plt.subplots(figsize=(10, 6))
-                            scatter = ax.scatter(X2[:, 0], X2[:, 1], c=labels, s=20, alpha=0.85)
+                            ax.scatter(X2[:, 0], X2[:, 1], c=labels, s=20, alpha=0.85)
                             ax.set_title("Clusters (PCA 2D)")
                             ax.set_xlabel("PC1")
                             ax.set_ylabel("PC2")
@@ -792,12 +827,10 @@ if uploaded_file is not None:
                             st.pyplot(fig)
                             plt.close(fig)
 
-                            # Perfil dos clusters (média/proporção por feature)
                             st.subheader("Perfis dos Clusters (médias / proporções)")
                             prof_df = pd.DataFrame(cl_art["cluster_profile"])
                             st.dataframe(prof_df, use_container_width=True)
 
-                            # Amostra etiquetada
                             st.subheader("Amostra de linhas com rótulo do cluster")
                             st.dataframe(pd.DataFrame(cl_art["cluster_sample_labeled"]), use_container_width=True)
 
@@ -809,14 +842,12 @@ else:
     ## 🎯 Análise Exploratória de Dados com IA
 
     **Funcionalidades:**
-    - 📊 **Distribuições**: Histogramas e gráficos de barras para todas as variáveis
-    - 🔍 **Correlações**: Matriz de correlação e identificação de relações
-    - 📈 **Tendências**: Linhas de tendência e análise temporal
-    - ⚠️ **Anomalias**: Detecção de outliers com boxplots
+    - 📊 **Distribuições**: Histogramas e gráficos de barras
+    - 🔍 **Correlações**: Matriz e pares significativos
+    - 📈 **Tendências**: Dispersão temporal + linha de tendência
+    - ⚠️ **Anomalias**: Outliers (IQR/z-score) e boxplots
     - 🧩 **Clusters**: KMeans com seleção automática de K e PCA 2D
-    - 🤖 **Chat IA**: Conversação com memória sobre os dados (inclui outliers, correlações, categorias, clusters)
+    - 🤖 **Chat IA**: Conversa usando o contexto gerado (inclui clusters)
 
-    **APIs Suportadas:** OpenAI, Groq, Gemini
-
-    **Como usar:** Carregue um arquivo CSV e explore as análises automáticas.
+    **Dica**: Se alguma aba não aparecer, verifique as dependências indicadas no topo do código.
     """)
