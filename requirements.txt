@@ -1,9 +1,18 @@
-streamlit
-pandas
-matplotlib
-seaborn
-numpy
-groq
-openai
-google-generativeai
-scipy
+# App e UI
+streamlit>=1.28.0
+
+# Data & gráficos
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+scipy>=1.10.0
+
+# ML (clusters, PCA, scaler)
+scikit-learn>=1.3.0
+
+# SDKs de IA (opcionais, escolha os que vai usar)
+openai>=1.0.0
+groq>=0.9.0
+google-generativeai>=0.5.0
+
