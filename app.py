@@ -94,8 +94,8 @@ if uploaded_file is not None:
                 
                 if numeric_cols:
                     st.subheader("Estatísticas")
-                    stats.df = data[numeric_cols].describe().T
-                    stats.df["var"] = data[numeric_cols].var()
+                    stats_df = data[numeric_cols].describe().T
+                    stats_df["var"] = data[numeric_cols].var()
                     st.dataframe(stats_df.T, use_container_width=True)
         
         with tab2:
