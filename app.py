@@ -94,7 +94,9 @@ if uploaded_file is not None:
                 
                 if numeric_cols:
                     st.subheader("Estatísticas")
-                    st.dataframe(data[numeric_cols].describe(), use_container_width=True)
+                    stats.df = data[numeric_cols].describe().T
+                    stats.df["var"] = data[numeric_cols].var()
+                    st.dataframe(stats_df.T, use_container_width=True)
         
         with tab2:
             st.header("📊 Distribuições")
