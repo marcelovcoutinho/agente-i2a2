@@ -420,7 +420,7 @@ uploaded_file = st.file_uploader("Carregue seu arquivo CSV", type=['csv'])
 
 if uploaded_file is not None:
     try:
-        data = pd.read_csv(uploaded_file)
+        data = pd.read_csv(uploaded_file, sep=None, engine="python")
         st.success(f"✅ Arquivo carregado: {data.shape[0]} linhas x {data.shape[1]} colunas")
 
         # ---- calcula EDA e PRESERVA clusters no rerun ----
