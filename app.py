@@ -4,6 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import io
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -41,10 +42,6 @@ if 'data_context' not in st.session_state:
 # IA - chamada com fallback
 # =========================
 def call_ai_api(api_choice, api_key, messages, model):
-    """
-    Lazy-import dos SDKs e compatibilidade com versões antigas/novas.
-    Retorna string com a resposta ou uma mensagem de erro amigável.
-    """
     try:
         if api_choice == "OpenAI":
             try:
@@ -52,7 +49,6 @@ def call_ai_api(api_choice, api_key, messages, model):
             except Exception:
                 return "Erro: o pacote 'openai' não está instalado. Rode: pip install -U openai"
 
-            # SDK novo (>=1.0) ou legado
             if hasattr(openai_pkg, "OpenAI"):
                 try:
                     client = openai_pkg.OpenAI(api_key=api_key)
@@ -61,7 +57,7 @@ def call_ai_api(api_choice, api_key, messages, model):
                     )
                     return resp.choices[0].message.content
                 except Exception:
-                    try:  # fallback p/ legado
+                    try:
                         openai_pkg.api_key = api_key
                         resp = openai_pkg.ChatCompletion.create(
                             model=model, messages=messages, max_tokens=2000, temperature=0.7
@@ -112,10 +108,79 @@ def call_ai_api(api_choice, api_key, messages, model):
         return f"Erro inesperado: {e}"
 
 # =========================
+# Leitura ROBUSTA de CSV
+# =========================
+ENC_OPTIONS = ["auto", "utf-8", "utf-8-sig", "latin-1", "cp1252", "utf-16", "utf-16-le", "utf-16-be"]
+SEP_OPTIONS = ["auto", ",", ";", "\\t", "|"]
+DEC_OPTIONS = ["auto", ".", ","]
+
+def _sep_value(v: str):
+    if v == "auto":
+        return None
+    if v == "\\t":
+        return "\t"
+    return v
+
+def _dec_value(v: str):
+    return None if v == "auto" else v
+
+def read_csv_smart(raw: bytes, enc_opt="auto", sep_opt="auto", dec_opt="auto") -> pd.DataFrame:
+    """
+    Tenta ler o CSV a partir de bytes, com:
+      - auto detecção de encoding/delimitador/decimal, OU
+      - overrides manuais (UI).
+    Estratégia:
+      1) Se usuário escolher manualmente algo != auto, tenta direto com isso.
+      2) Se qualquer parâmetro = auto, testa combinações comuns até obter um DF com >1 coluna,
+         priorizando (utf-8, utf-8-sig, latin-1, cp1252, utf-16) x (sep=None, ',', ';', '\t', '|') x (decimal='.', ',').
+      3) Fallback final: sep=None, encoding='latin-1' com errors='replace'.
+    """
+    # Caso manual (sem auto)
+    manual_encoding = enc_opt != "auto"
+    manual_sep = sep_opt != "auto"
+    manual_dec = dec_opt != "auto"
+
+    if manual_encoding and manual_sep and manual_dec:
+        text = raw.decode(enc_opt, errors="strict")
+        df = pd.read_csv(io.StringIO(text), sep=_sep_value(sep_opt), engine="python", decimal=_dec_value(dec_opt))
+        return df
+
+    # Ordem de tentativas em "auto"
+    encodings = [enc_opt] if manual_encoding else ["utf-8", "utf-8-sig", "latin-1", "cp1252", "utf-16"]
+    seps = [sep_opt] if manual_sep else [None, ",", ";", "\t", "|"]  # None => inferência
+    decimals = [dec_opt] if manual_dec else [".", ","]
+
+    last_err = None
+    for enc in encodings:
+        try:
+            text = raw.decode(enc, errors="strict")
+        except Exception as e:
+            last_err = e
+            continue
+        for sep in seps:
+            for dec in decimals:
+                try:
+                    df = pd.read_csv(io.StringIO(text), sep=sep, engine="python", decimal=dec)
+                    # Heurística: idealmente > 1 coluna
+                    if df.shape[1] > 1:
+                        return df
+                    # Se só 1 coluna, pode ser que decimal/sep estejam trocados; continua tentando
+                except Exception as e:
+                    last_err = e
+                    continue
+
+    # Fallback: substitui inválidos, tenta inferir sep
+    try:
+        text = raw.decode("latin-1", errors="replace")
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+        return df
+    except Exception as e:
+        raise RuntimeError(f"Falha ao ler CSV. Último erro: {last_err or e}")
+
+# =========================
 # Análises - artefatos p/ chat
 # =========================
 def compute_analysis_artifacts(df: pd.DataFrame):
-    """Calcula artefatos de TODAS as abas para o chat."""
     artifacts = {}
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -146,7 +211,7 @@ def compute_analysis_artifacts(df: pd.DataFrame):
         top_cats[col] = [{"categoria": str(i), "freq": int(v)} for i, v in vc.items()]
     artifacts["top_categories"] = top_cats
 
-    # Correlações significativas (ordenadas por |r|)
+    # Correlações significativas
     sig_corr = []
     if len(numeric_cols) > 1:
         corr = df[numeric_cols].corr()
@@ -315,7 +380,6 @@ def compute_cluster_artifacts(df: pd.DataFrame, numeric_cols, categorical_cols,
 
 # ---------- prompt builder ----------
 def build_chat_context(art):
-    """Contexto compacto com resultados de TODAS as abas (inclui Clusters)."""
     def fmt_rows(rows, keys, max_rows=10):
         rows = rows[:max_rows]
         out = []
@@ -323,20 +387,16 @@ def build_chat_context(art):
             out.append(", ".join([f"{k}={r.get(k)}" for k in keys if k in r]))
         return "\n".join(out) if out else "—"
 
-    # Estatísticas
     num_stats = art.get("numeric_describe", [])
     stat_keys = [k for k in ["coluna", "count", "mean", "std", "var", "min", "25%", "50%", "75%", "max"] if any(k in d for d in num_stats)]
     stats_txt = fmt_rows(num_stats, stat_keys, max_rows=15)
 
-    # Correlações
     corr = art.get("significant_correlations", [])[:15]
     corr_txt = fmt_rows(corr, ["var1", "var2", "r", "forca"], max_rows=15)
 
-    # Outliers
     outs = art.get("outliers_summary", [])[:15]
     outs_txt = fmt_rows(outs, ["variavel", "outliers_iqr", "pct_iqr", "outliers_z", "pct_z"], max_rows=15)
 
-    # Categóricas
     cats = art.get("top_categories", {})
     cats_txt_parts = []
     for col, items in cats.items():
@@ -344,11 +404,9 @@ def build_chat_context(art):
         cats_txt_parts.append(f"{col}: {snippet}")
     cats_txt = "\n".join(cats_txt_parts) if cats_txt_parts else "—"
 
-    # Nulos
     nulos = art.get("missing_values", [])
     nulos_txt = fmt_rows(nulos, ["coluna", "nulos"], max_rows=30)
 
-    # Clusters
     if art.get("cluster_available", False):
         k = art.get("cluster_k")
         sil = art.get("cluster_silhouette")
@@ -415,12 +473,20 @@ Você é um especialista em análise de dados. Responda usando APENAS o contexto
 st.title("🤖 Análise Exploratória de Dados")
 st.markdown("**Análise completa de CSV com IA conversacional**")
 
-# Upload
+# Upload + opções avançadas
 uploaded_file = st.file_uploader("Carregue seu arquivo CSV", type=['csv'])
+
+with st.expander("⚙️ Opções de importação (avançado)"):
+    enc_opt = st.selectbox("Encoding", ENC_OPTIONS, index=0, help="Se 'auto' falhar, escolha manualmente.")
+    sep_opt = st.selectbox("Delimitador", SEP_OPTIONS, index=0, help="Use '\\t' para tabulação.")
+    dec_opt = st.selectbox("Separador decimal", DEC_OPTIONS, index=0, help="Auto tenta '.' e ','.")
 
 if uploaded_file is not None:
     try:
-        data = pd.read_csv(uploaded_file, sep=None, engine="python")
+        # Lê bytes uma vez e reusa
+        raw = uploaded_file.getvalue()
+        data = read_csv_smart(raw, enc_opt=enc_opt, sep_opt=sep_opt, dec_opt=dec_opt)
+
         st.success(f"✅ Arquivo carregado: {data.shape[0]} linhas x {data.shape[1]} colunas")
 
         # ---- calcula EDA e PRESERVA clusters no rerun ----
@@ -428,16 +494,13 @@ if uploaded_file is not None:
         if st.session_state.data_context is None:
             st.session_state.data_context = artifacts
         else:
-            # preserva chaves de cluster (se já existirem) antes de atualizar EDA
             preserved_keys = [
                 "cluster_available","cluster_k","cluster_silhouette","cluster_labels",
                 "cluster_pca_2d","cluster_profile","cluster_feat_names",
                 "cluster_sample_labeled","cluster_silhouettes_grid"
             ]
             preserved = {k: st.session_state.data_context.get(k) for k in preserved_keys}
-            # atualiza com nova EDA
             st.session_state.data_context.update(artifacts)
-            # restaura clusters se existirem
             for k, v in preserved.items():
                 if v not in (None, [], {}, False):
                     st.session_state.data_context[k] = v
@@ -481,7 +544,6 @@ if uploaded_file is not None:
                     stats_df["Variância"] = data[numeric_cols].var()  # ddof=1
                     st.dataframe(stats_df.T, use_container_width=True)
 
-                # Recalcular EDA PRESERVANDO clusters
                 if st.button("🔄 Atualizar análise (recalcular artefatos)"):
                     new_art = compute_analysis_artifacts(data)
                     preserved_keys = [
@@ -542,7 +604,7 @@ if uploaded_file is not None:
 
                     for bar, value in zip(bars, value_counts.values):
                         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(value_counts.values)*0.01,
-                                f'{value:,}', ha='center', va='bottom', color='white', fontsize=9)
+                            f'{value:,}', ha='center', va='bottom', color='white', fontsize=9)
 
                     plt.tight_layout()
                     st.pyplot(fig)
@@ -569,7 +631,6 @@ if uploaded_file is not None:
                 st.pyplot(fig)
                 plt.close(fig)
 
-                # Pares significativos
                 st.subheader("Correlações Significativas")
                 correlations = []
                 for i in range(len(correlation_matrix.columns)):
@@ -800,7 +861,7 @@ if uploaded_file is not None:
                         if not cl_art.get("cluster_available", False):
                             st.error("Não foi possível formar clusters estáveis (ou scikit-learn ausente).")
                         else:
-                            # >>> registra clusters na 'memória' e mantém nos reruns <<<
+                            # Registra clusters na 'memória' e mantém nos reruns
                             st.session_state.data_context.update(cl_art)
 
                             if cl_art['cluster_silhouette'] is not None:
@@ -835,7 +896,7 @@ if uploaded_file is not None:
                             st.dataframe(pd.DataFrame(cl_art["cluster_sample_labeled"]), use_container_width=True)
 
     except Exception as e:
-        st.error(f"❌ Erro: {str(e)}")
+        st.error(f"❌ Erro ao ler/processar o CSV: {str(e)}")
 
 else:
     st.markdown("""
@@ -849,5 +910,6 @@ else:
     - 🧩 **Clusters**: KMeans com seleção automática de K e PCA 2D
     - 🤖 **Chat IA**: Conversa usando o contexto gerado (inclui clusters)
 
-    **Dica**: Se alguma aba não aparecer, verifique as dependências indicadas no topo do código.
+    **Dica**: Se a leitura automática do CSV não separar as colunas corretamente,
+    abra "⚙️ Opções de importação (avançado)" e ajuste *Encoding*, *Delimitador* e *Decimal*.
     """)
